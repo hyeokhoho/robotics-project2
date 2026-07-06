@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <title>AI 로봇 사진사 갤러리</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/roslib/build/roslib.min.js"></script>
+
+  <style>
+    body {
+      margin: 0;
+      background: #111;
+      color: white;
+      font-family: sans-serif;
+      text-align: center;
+    }
+
+    h2 {
+      margin-top: 20px;
+    }
+
+    #status {
+      padding: 12px;
+      font-size: 18px;
+      font-weight: bold;
+      white-space: pre-line;
+    }
+
+    #gallery {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: center;
+      gap: 12px;
+      padding: 20px;
+    }
+
+    .card {
+      background: #222;
+      padding: 10px;
+      border-radius: 12px;
+      width: 220px;
+    }
+
+    .card img {
+      width: 100%;
+      border-radius: 8px;
+      border: 2px solid white;
+    }
+
+    .filename {
+      font-size: 12px;
+      color: #ccc;
+      margin-top: 6px;
+      word-break: break-all;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>📸 AI 로봇 사진사 갤러리</h2>
+  <div id="status">갤러리 준비 중</div>
+  <div id="gallery"></div>
+
+  <script>
+    const status = document.getElementById("status");
+    const gallery = document.getElementById("gallery");
+
+    // 네 노트북 IP로 수정
+    const ROSBRIDGE_URL = "wss://192.168.0.38:9090";
+
+    let ros = null;
+    let photoTopic = null;
+
+    setupROS();
+    loadSavedPhotos();
+
+    function setupROS() {
+      try {
+        ros = new ROSLIB.Ros({
+          url: ROSBRIDGE_URL
+        });
+
+        ros.on("connection", () => {
+          status.innerText = "ROS 연결됨. /photo 구독 중";
+        });
+
+        ros.on("error", (error) => {
+          console.log("ROS 오류:", error);
+          status.innerText = "ROS 연결 오류. 저장된 사진은 표시됨.";
+        });
+
+        ros.on("close", () => {
+          status.innerText = "ROS 연결 종료";
+        });
+
+        photoTopic = new ROSLIB.Topic({
+          ros: ros,
+          name: "/photo",
+          messageType: "std_msgs/String"
+        });
+
+        photoTopic.subscribe(async (msg) => {
+          const jpeg = msg.data;
+
+          addImageToGallery(jpeg, "방금 수신한 /photo");
+          await saveToServer(jpeg);
+        });
+
+      } catch (e) {
+        console.log("ROS 초기화 실패:", e);
+        status.innerText = "ROS 초기화 실패. 저장된 사진만 표시됨.";
+      }
+    }
+
+    function addImageToGallery(src, name) {
+      const card = document.createElement("div");
+      card.className = "card";
+
+      const img = document.createElement("img");
+      img.src = src;
+
+      const label = document.createElement("div");
+      label.className = "filename";
+      label.innerText = name;
+
+      card.appendChild(img);
+      card.appendChild(label);
+
+      gallery.prepend(card);
+    }
+
+    async function saveToServer(jpeg) {
+      try {
+        const res = await fetch("/upload", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            image: jpeg
+          })
+        });
+
+        const data = await res.json();
+
+        if (data.ok) {
+          status.innerText = "저장 완료: " + data.filename;
+        } else {
+          status.innerText = "서버 저장 실패";
+        }
+
+      } catch (err) {
+        console.log("업로드 오류:", err);
+        status.innerText = "업로드 오류: " + err.message;
+      }
+    }
+
+    async function loadSavedPhotos() {
+      try {
+        const res = await fetch("/list_photos");
+        const data = await res.json();
+
+        for (const url of data.photos.reverse()) {
+          addImageToGallery(url, url);
+        }
+
+        if (data.photos.length > 0) {
+          status.innerText = `저장된 사진 ${data.photos.length}장 불러옴`;
+        }
+
+      } catch (err) {
+        console.log("저장 사진 로딩 실패:", err);
+      }
+    }
+  </script>
+</body>
+</html>
