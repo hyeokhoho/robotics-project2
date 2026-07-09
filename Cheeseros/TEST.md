@@ -22,9 +22,25 @@
 -----------------------------------------------------------------------------------------------------------
 [버그 트레킹표]
 
-# 버그 트래킹 표 (Bug Tracking)
-
-| ID | 증상 | 원인 | 조치 | 상태 | 담당 |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **B-01** | 로봇 간헐적 멈춤 | 폰 백그라운드 전환 | visibilitychange 정지 처리 | 해결 | 홍길동 |
-| **B-02** | 센서값 미수신 | QoS 불일치 (BE ↔ REL) | 구독자 BEST_EFFORT로 변경 | 해결 | 박민수 |
+버그 트래킹 표 (Bug Tracking)
+ID	증상	원인	조치	상태	담당
+B-01	여러 명이 화면에 있을 때 로봇이 사람을 번갈아 추적하며 좌우로 계속 회전	/subject를 가장 최근 검출된 사람 기준으로 발행	그룹 중심(cx) 계산 및 EMA(Smoothing) 적용	해결	AI A
+B-02	전신 촬영에서 웃지 않았는데도 자동 촬영	smile threshold가 너무 낮아 무표정도 미소로 판정	평균 미소값 + 개인 미소값 + 디바운스 조건 추가	해결	AI B
+B-03	전원이 웃었는데도 촬영이 되지 않음	얼굴이 작아 FaceLandmarker 검출 실패	Pose 기반 얼굴 Crop 후 FaceLandmarker 재검출	해결	AI B
+B-04	TTS가 중간에 끊기며 여러 음성이 겹쳐 들림	새로운 TTS가 기존 TTS를 즉시 취소	일반 안내 TTS는 큐 유지, 카운트다운만 인터럽트 허용	해결	웹
+B-05	카운트다운(3-2-1)이 끝나기 전에 사진 촬영	촬영 타이밍과 음성 종료 타이밍이 분리됨	"하나" 종료 후 1초 대기 후 촬영하도록 수정	해결	웹
+B-06	"좋아요! 그대로 웃어주세요."가 계속 반복됨	Framed 상태가 매 프레임마다 다시 진입	상태 머신(TRACKING → FRAMED → COUNTDOWN) 적용	해결	ROS
+B-07	촬영 직후 또 촬영되는 연사 현상	Smile Hold와 Cooldown이 동시에 초기화되지 않음	촬영 후 Smile Timer 초기화 및 5초 Cooldown 적용	해결	ROS
+B-08	단체사진에서 구도가 한쪽으로 치우침	가장 큰 사람 기준으로 중심 계산	그룹 Bounding Box와 평균 중심값으로 변경	해결	AI A
+B-09	스마트폰 웹 수정 후 이전 코드가 실행됨	브라우저 캐시 사용	URL 버전(?v=5) 적용 및 강력 새로고침	해결	웹
+B-10	/cmd_vel은 발행되지만 로봇이 움직이지 않음	TurtleBot3 Bringup 미실행	robot.launch.py 실행 후 /cmd_vel Subscriber 확인	해결	ROS
+B-11	/subject 토픽이 발행되지 않음	rosbridge 미연결 또는 Domain ID 불일치	ROS_DOMAIN_ID 통일 및 rosbridge 재실행	해결	통합
+B-12	HTTPS 접속 시 404 오류	프로젝트 구조 변경 후 서버 루트 미수정	/web/photo_test_v2.html 경로로 수정	해결	웹
+B-13	HTTPS 서버에서 인증서 오류	cert.pem, key.pem 경로 변경	인증서 디렉터리(cert/) 기준으로 수정	해결	웹
+B-14	긴급정지 버튼이 동작하지 않음	GPIO Busy 및 잘못된 GPIO 사용	사용하지 않는 GPIO6으로 변경 및 노드 분리	해결	ROS
+B-15	긴급정지 버튼을 눌러도 정지하지 않음	Emergency 토픽 미구독	framing_node에서 /emergency_stop 구독 추가	해결	ROS
+B-16	여러 명 촬영 시 얼굴 수와 사람 수가 맞지 않음	Pose와 Face 검출 개수가 일치하지 않음	Pose 기준 사람 수와 Face 검출 수 비교 후 촬영 허용	해결	AI B
+B-17	사진 저장은 되지만 갤러리에 바로 표시되지 않음	/photo 발행 순서가 서버 저장보다 빨랐음	저장 완료 후 /photo 발행 순서로 수정	해결	웹
+B-18	로봇이 목표 위치 근처에서 좌우로 떨림	P Gain이 크고 Deadband가 좁음	Deadband 확대 및 EMA 필터 적용	해결	ROS
+B-19	사람을 잃어도 계속 회전하는 경우 발생	마지막 /subject 값 유지	Subject Timeout 적용 후 정지	해결	ROS
+B-20	단체사진에서 일부 사람만 프레임에 들어와도 촬영	그룹 전체 Bounding Box 미확인	그룹 Bounding Box가 프레임 내부일 때만 촬영 허용	해결	AI A
