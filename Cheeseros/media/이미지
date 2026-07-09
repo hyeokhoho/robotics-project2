@@ -1,0 +1,13 @@
+flowchart TD
+    A[스마트폰 Web<br/>photo_test_v2.html] -->|/subject cx,size 10Hz| B[rosbridge_server<br/>WSS 9090]
+    A -->|/all_smiling Bool| B
+
+    B --> C[framing_node.py<br/>2축 P 제어]
+    C -->|/cmd_vel| D[TurtleBot3<br/>회전/전후진]
+    C -->|/shoot| A
+    C -->|/tts_text| A
+
+    A -->|/photo base64 JPEG| E[gallery.html<br/>실시간 표시]
+    A -->|/upload| F[HTTPS Server<br/>사진 저장]
+
+    G[GPIO 긴급정지 버튼] -->|/emergency_stop| C
