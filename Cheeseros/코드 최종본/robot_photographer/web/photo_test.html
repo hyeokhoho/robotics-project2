@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>AI 로봇 사진사 - 촬영폰</title>
+
+  <script src="https://cdn.jsdelivr.net/npm/roslib/build/roslib.min.js"></script>
+
+  <style>
+    body {
+      margin: 0;
+      font-family: sans-serif;
+      background: #111;
+      color: white;
+      text-align: center;
+    }
+
+    #wrap {
+      position: relative;
+      width: 100%;
+      max-width: 720px;
+      margin: auto;
+    }
+
+    video, canvas {
+      width: 100%;
+      border-radius: 12px;
+    }
+
+    #overlay {
+      position: absolute;
+      left: 0;
+      top: 0;
+    }
+
+    #status {
+      padding: 12px;
+      font-size: 18px;
+      font-weight: bold;
+      white-space: pre-line;
+    }
+
+    #gallery img {
+      width: 150px;
+      margin: 8px;
+      border-radius: 10px;
+      border: 2px solid white;
+    }
+
+    button {
+      margin: 8px;
+      padding: 12px 18px;
+      font-size: 16px;
+      border-radius: 8px;
+      border: none;
+    }
+  </style>
+</head>
+
+<body>
+  <h2>📸 AI 로봇 사진사 - 촬영폰</h2>
+
+  <button id="startBtn">카메라 시작</button>
+  <button id="manualShootBtn">수동 촬영</button>
+
+  <div id="status">대기 중</div>
+
+  <div id="wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <h3>촬영폰 미리보기</h3>
+  <div id="gallery"></div>
+
+  <script type="module">
+    import {
+      FaceLandmarker,
+      PoseLandmarker,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+    const video = document.getElementById("video");
+    const overlay = document.getElementById("overlay");
+    const ctx = overlay.getContext("2d");
+    const status = document.getElementById("status");
+    const gallery = document.getElementById("gallery");
+    const startBtn = document.getElementById("startBtn");
+    const manualShootBtn = document.getElementById("manualShootBtn");
+
+    let faceLandmarker = null;
+    let poseLandmarker = null;
+    let running = false;
+
+    const CX_TARGET = 0.5;
+    const SIZE_TARGET = 0.5;
+
+    const CX_DEADBAND = 0.10;
+    const SIZE_DEADBAND = 0.12;
+
+    const SMILE_THRESHOLD = 0.25;
+    const SMILE_HOLD = 1200;
+    const SHOOT_COOLDOWN = 5000;
+
+    const SMILE_HISTORY_SIZE = 10;
+    const SMILE_REQUIRED_COUNT = 6;
+    let smileHistory = [];
+
+    let smilingSince = null;
+    let lastShot = 0;
+    let guideSaid = false;
+
+    let lastGuideText = "";
+    let lastGuideTime = 0;
+    const GUIDE_TTS_COOLDOWN = 2000;
+
+    const ROSBRIDGE_URL = "wss://192.168.0.38:9090";
+
+    let ros = null;
+    let subjectTopic = null;
+    let smilingTopic = null;
+    let photoTopic = null;
+    let shootTopic = null;
+    let ttsTopic = null;
+
+    setupROS();
+
+    startBtn.addEventListener("click", startCamera);
+    manualShootBtn.addEventListener("click", takePhoto);
+
+    function setupROS() {
+      try {
+        ros = new ROSLIB.Ros({
+          url: ROSBRIDGE_URL
+        });
+
+        ros.on("connection", () => {
+          console.log("rosbridge 연결됨");
+        });
+
+        ros.on("error", (error) => {
+          console.log("rosbridge 오류:", error);
+        });
+
+        ros.on("close", () => {
+          console.log("rosbridge 연결 종료");
+        });
+
+        subjectTopic = new ROSLIB.Topic({
+          ros: ros,
+          name: "/subject",
+          messageType: "std_msgs/String"
+        });
+
+        smilingTopic = new ROSLIB.Topic({
+          ros: ros,
+          name: "/all_smiling",
+          messageType: "std_msgs/Bool"
+        });
+
+        photoTopic = new ROSLIB.Topic({
+          ros: ros,
+          name: "/photo",
+          messageType: "std_msgs/String"
+        });
+
+        shootTopic = new ROSLIB.Topic({
+          ros: ros,
+          name: "/shoot",
+          messageType: "std_msgs/Bool"
+        });
+
+        ttsTopic = new ROSLIB.Topic({
+          ros: ros,
+          name: "/tts_text",
+          messageType: "std_msgs/String"
+        });
+
+        shootTopic.subscribe((msg) => {
+          if (msg.data === true) {
+            takePhoto();
+          }
+        });
+
+        ttsTopic.subscribe((msg) => {
+          guideSay(msg.data);
+        });
+
+      } catch (e) {
+        console.log("ROS 초기화 실패:", e);
+      }
+    }
+
+    async function startCamera() {
+      try {
+        startBtn.disabled = true;
+        status.innerText = "1단계: 카메라 권한 요청 중...";
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "user",
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            aspectRatio: { ideal: 1.777777 }
+          },
+          audio: false
+        });
+
+        video.srcObject = stream;
+
+        await new Promise((resolve) => {
+          video.onloadedmetadata = resolve;
+        });
+
+        await video.play();
+
+        overlay.width = video.videoWidth;
+        overlay.height = video.videoHeight;
+
+        status.innerText = "2단계: MediaPipe WASM 로딩 중...";
+
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+        );
+
+        status.innerText = "3단계: Pose 모델 로딩 중...";
+
+        poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+            delegate: "CPU"
+          },
+          runningMode: "VIDEO",
+          numPoses: 1
+        });
+
+        status.innerText = "4단계: Face 모델 로딩 중...";
+
+        faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
+            delegate: "CPU"
+          },
+          runningMode: "VIDEO",
+          outputFaceBlendshapes: true,
+          numFaces: 1
+        });
+
+        running = true;
+        status.innerText = "인식 시작";
+        detectLoop();
+
+      } catch (err) {
+        console.error(err);
+        status.innerText =
+          "오류 발생:\n" + err.message +
+          "\n\n가능 원인:\n1. HTTPS/카메라 권한 문제\n2. 인터넷/CDN 접속 실패\n3. 모델 다운로드 실패\n4. 브라우저 호환 문제";
+        startBtn.disabled = false;
+      }
+    }
+
+    function say(text) {
+      try {
+        speechSynthesis.cancel();
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.lang = "ko-KR";
+        utter.rate = 1.0;
+        speechSynthesis.speak(utter);
+      } catch (e) {
+        console.log("TTS 오류:", e);
+      }
+    }
+
+    function guideSay(text) {
+      const now = performance.now();
+
+      if (text !== lastGuideText || now - lastGuideTime > GUIDE_TTS_COOLDOWN) {
+        say(text);
+        lastGuideText = text;
+        lastGuideTime = now;
+      }
+    }
+
+    function getSmileScore(blendshapes) {
+      if (!blendshapes || blendshapes.length === 0) return 0;
+
+      const categories = blendshapes[0].categories;
+      const left = categories.find(c => c.categoryName === "mouthSmileLeft");
+      const right = categories.find(c => c.categoryName === "mouthSmileRight");
+
+      const l = left ? left.score : 0;
+      const r = right ? right.score : 0;
+
+      return (l + r) / 2;
+    }
+
+    function updateSmileDebounce(smileScore) {
+      const rawSmile = smileScore > SMILE_THRESHOLD;
+
+      smileHistory.push(rawSmile);
+
+      if (smileHistory.length > SMILE_HISTORY_SIZE) {
+        smileHistory.shift();
+      }
+
+      const smileCount = smileHistory.filter(v => v === true).length;
+      return smileCount >= SMILE_REQUIRED_COUNT;
+    }
+
+    function getPoseBox(landmarks) {
+      let minX = 1;
+      let maxX = 0;
+      let minY = 1;
+      let maxY = 0;
+      let validCount = 0;
+
+      for (const p of landmarks) {
+        if (p.visibility !== undefined && p.visibility < 0.45) continue;
+
+        minX = Math.min(minX, p.x);
+        maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y);
+        maxY = Math.max(maxY, p.y);
+        validCount++;
+      }
+
+      if (validCount < 5) {
+        return null;
+      }
+
+      return {
+        minX,
+        maxX,
+        minY,
+        maxY,
+        cx: (minX + maxX) / 2,
+        size: maxY - minY
+      };
+    }
+
+    function drawOverlay(box, smiling, smileScore, framed) {
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+      const w = overlay.width;
+      const h = overlay.height;
+
+      const x = box.minX * w;
+      const y = box.minY * h;
+      const bw = (box.maxX - box.minX) * w;
+      const bh = (box.maxY - box.minY) * h;
+
+      ctx.strokeStyle = framed ? "lime" : "orange";
+      ctx.lineWidth = 4;
+      ctx.strokeRect(x, y, bw, bh);
+
+      ctx.strokeStyle = "white";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(w * CX_TARGET, 0);
+      ctx.lineTo(w * CX_TARGET, h);
+      ctx.stroke();
+
+      ctx.strokeStyle = "cyan";
+      ctx.lineWidth = 2;
+      ctx.strokeRect(
+        w * 0.25,
+        h * 0.25,
+        w * 0.5,
+        h * SIZE_TARGET
+      );
+
+      ctx.fillStyle = smiling ? "lime" : "red";
+      ctx.font = "22px sans-serif";
+      ctx.fillText(`cx: ${box.cx.toFixed(2)}`, 20, 40);
+      ctx.fillText(`size: ${box.size.toFixed(2)}`, 20, 70);
+      ctx.fillText(`smileScore: ${smileScore.toFixed(2)}`, 20, 100);
+      ctx.fillText(`smiling: ${smiling}`, 20, 130);
+      ctx.fillText(`framed: ${framed}`, 20, 160);
+    }
+
+    function publishSubject(cx, size) {
+      if (!subjectTopic || !ros || !ros.isConnected) return;
+
+      subjectTopic.publish(new ROSLIB.Message({
+        data: JSON.stringify({
+          cx: cx,
+          size: size
+        })
+      }));
+    }
+
+    function publishSmile(smiling) {
+      if (!smilingTopic || !ros || !ros.isConnected) return;
+
+      smilingTopic.publish(new ROSLIB.Message({
+        data: smiling
+      }));
+    }
+
+    async function takePhoto() {
+      if (!video.videoWidth || !video.videoHeight) {
+        status.innerText = "카메라가 아직 준비되지 않았습니다.";
+        return;
+      }
+
+      const srcW = video.videoWidth;
+      const srcH = video.videoHeight;
+
+      const maxW = 960;
+      const scale = maxW / srcW;
+
+      const outW = Math.round(srcW * scale);
+      const outH = Math.round(srcH * scale);
+
+      const snap = document.createElement("canvas");
+      snap.width = outW;
+      snap.height = outH;
+
+      const snapCtx = snap.getContext("2d");
+      snapCtx.drawImage(video, 0, 0, outW, outH);
+
+      const jpeg = snap.toDataURL("image/jpeg", 0.8);
+
+      const img = document.createElement("img");
+      img.src = jpeg;
+      gallery.prepend(img);
+
+      if (photoTopic && ros && ros.isConnected) {
+        photoTopic.publish(new ROSLIB.Message({
+          data: jpeg
+        }));
+      }
+
+      try {
+        status.innerText = "촬영 완료. 서버 저장 중...";
+
+        const res = await fetch("/upload", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            image: jpeg
+          })
+        });
+
+        const data = await res.json();
+
+        if (data.ok) {
+          status.innerText =
+            "촬영 완료\n/photo 발행 시도됨\n서버 저장됨: " + data.filename;
+        } else {
+          status.innerText = "촬영은 됐지만 서버 저장 실패";
+        }
+
+      } catch (err) {
+        status.innerText =
+          "촬영은 됐지만 서버 저장 실패:\n" + err.message;
+      }
+
+      say("찰칵! 촬영했습니다.");
+    }
+
+    function detectLoop() {
+      if (!running || !poseLandmarker || !faceLandmarker) return;
+
+      const now = performance.now();
+
+      const poseResult = poseLandmarker.detectForVideo(video, now);
+      const faceResult = faceLandmarker.detectForVideo(video, now);
+
+      if (!poseResult.landmarks || poseResult.landmarks.length === 0) {
+        status.innerText = "사람 없음";
+
+        smilingSince = null;
+        guideSaid = false;
+        smileHistory = [];
+
+        ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+        publishSmile(false);
+
+        requestAnimationFrame(detectLoop);
+        return;
+      }
+
+      const pose = poseResult.landmarks[0];
+      const box = getPoseBox(pose);
+
+      if (!box) {
+        status.innerText = "사람 인식 불안정";
+        smilingSince = null;
+        smileHistory = [];
+        publishSmile(false);
+        requestAnimationFrame(detectLoop);
+        return;
+      }
+
+      const smileScore = getSmileScore(faceResult.faceBlendshapes);
+      const smiling = updateSmileDebounce(smileScore);
+
+      const framed =
+        Math.abs(box.cx - CX_TARGET) < CX_DEADBAND &&
+        Math.abs(box.size - SIZE_TARGET) < SIZE_DEADBAND;
+
+      drawOverlay(box, smiling, smileScore, framed);
+
+      publishSubject(box.cx, box.size);
+      publishSmile(smiling);
+
+      if (!framed) {
+        guideSaid = false;
+        smilingSince = null;
+
+        let guideText = "";
+
+        if (box.cx < CX_TARGET - CX_DEADBAND) {
+          guideText = "오른쪽으로 한 걸음 이동하세요";
+        } else if (box.cx > CX_TARGET + CX_DEADBAND) {
+          guideText = "왼쪽으로 한 걸음 이동하세요";
+        } else if (box.size < SIZE_TARGET - SIZE_DEADBAND) {
+          guideText = "조금 가까이 오세요";
+        } else if (box.size > SIZE_TARGET + SIZE_DEADBAND) {
+          guideText = "조금 뒤로 가세요";
+        }
+
+        if (guideText !== "") {
+          status.innerText = guideText;
+          guideSay(guideText);
+        }
+
+      } else {
+        if (!guideSaid) {
+          guideSay("좋아요! 그대로 웃어주세요.");
+          guideSaid = true;
+        }
+
+        if (smiling) {
+          status.innerText = "구도 완료. 웃는 중...";
+
+          if (smilingSince === null) {
+            smilingSince = now;
+          }
+
+          if (now - smilingSince > SMILE_HOLD && now - lastShot > SHOOT_COOLDOWN) {
+            lastShot = now;
+            smilingSince = null;
+            takePhoto();
+          }
+        } else {
+          status.innerText = "구도 완료. 웃어주세요.";
+          smilingSince = null;
+        }
+      }
+
+      requestAnimationFrame(detectLoop);
+    }
+  </script>
+</body>
+</html>

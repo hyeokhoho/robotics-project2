@@ -1,0 +1,901 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <title>AI 로봇 사진사 - 촬영폰 V2</title>
+  <script src="https://cdn.jsdelivr.net/npm/roslib/build/roslib.min.js"></script>
+  <style>
+    body { margin:0; font-family:sans-serif; background:#111; color:white; text-align:center; }
+    #wrap { position:relative; width:100%; max-width:720px; margin:auto; }
+    video, canvas { width:100%; border-radius:12px; }
+    #overlay { position:absolute; left:0; top:0; }
+    #status { padding:12px; font-size:18px; font-weight:bold; white-space:pre-line; }
+    #controls { margin:10px; }
+    #gallery img { width:150px; margin:8px; border-radius:10px; border:2px solid white; }
+    button { margin:5px; padding:12px 18px; font-size:16px; border-radius:8px; border:none; }
+  </style>
+</head>
+
+<body>
+  <h2>📸 AI 로봇 사진사 - 촬영폰 V2</h2>
+
+  <div id="controls">
+    <button id="startBtn">카메라 시작</button>
+    <button id="manualShootBtn">수동 촬영</button>
+    <button id="centerModeBtn">중앙 구도</button>
+    <button id="leftThirdBtn">왼쪽 3분할</button>
+    <button id="rightThirdBtn">오른쪽 3분할</button>
+  </div>
+
+  <div id="status">대기 중</div>
+
+  <div id="wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="overlay"></canvas>
+  </div>
+
+  <h3>촬영폰 미리보기</h3>
+  <div id="gallery"></div>
+
+  <script type="module">
+    import {
+      FaceLandmarker,
+      PoseLandmarker,
+      FilesetResolver
+    } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14";
+
+    const video = document.getElementById("video");
+    const overlay = document.getElementById("overlay");
+    const ctx = overlay.getContext("2d");
+    const status = document.getElementById("status");
+    const gallery = document.getElementById("gallery");
+
+    const startBtn = document.getElementById("startBtn");
+    const manualShootBtn = document.getElementById("manualShootBtn");
+    const centerModeBtn = document.getElementById("centerModeBtn");
+    const leftThirdBtn = document.getElementById("leftThirdBtn");
+    const rightThirdBtn = document.getElementById("rightThirdBtn");
+
+    let faceLandmarker = null;
+    let poseLandmarker = null;
+    let running = false;
+
+    let CX_TARGET = 0.5;
+    const SIZE_TARGET = 0.42;
+    const CX_DEADBAND = 0.10;
+    const SIZE_DEADBAND = 0.14;
+
+    const SMILE_THRESHOLD = 0.25;
+    const AVG_SMILE_THRESHOLD = 0.35;
+    const SMILE_HOLD = 1500;
+    const SHOOT_COOLDOWN = 5000;
+
+    const SMILE_HISTORY_SIZE = 10;
+    const SMILE_REQUIRED_COUNT = 7;
+    let smileHistory = [];
+
+    let smilingSince = null;
+    let lastShot = 0;
+    let guideSaid = false;
+
+    let smoothCx = null;
+    let smoothSize = null;
+    const SUBJECT_SMOOTH_ALPHA = 0.25;
+
+    let lastSubjectPublish = 0;
+    const SUBJECT_PUBLISH_INTERVAL = 100;
+    let lastSmileState = null;
+
+    const STATE_TRACKING = "TRACKING";
+    const STATE_FRAMED = "FRAMED";
+    const STATE_COUNTDOWN = "COUNTDOWN";
+    const STATE_CAPTURE = "CAPTURE";
+    const STATE_COOLDOWN = "COOLDOWN";
+    let shootState = STATE_TRACKING;
+
+    let lastGuideText = "";
+    let lastGuideTime = 0;
+    let pendingGuideText = "";
+    let pendingGuideStart = 0;
+    const GUIDE_STABLE_TIME = 900;
+    const GUIDE_REPEAT_GAP = 5000;
+
+    let ttsBusy = false;
+
+    const ROSBRIDGE_URL = "wss://192.168.0.38:9090";
+
+    let ros = null;
+    let subjectTopic = null;
+    let smilingTopic = null;
+    let photoTopic = null;
+    let shootTopic = null;
+    let ttsTopic = null;
+
+    const faceCropCanvas = document.createElement("canvas");
+    faceCropCanvas.width = 256;
+    faceCropCanvas.height = 256;
+    const faceCropCtx = faceCropCanvas.getContext("2d");
+
+    setupROS();
+
+    startBtn.addEventListener("click", startCamera);
+    manualShootBtn.addEventListener("click", startBestShotSequence);
+
+    centerModeBtn.addEventListener("click", () => {
+      CX_TARGET = 0.5;
+      speakAsync("중앙 구도 모드입니다.", true);
+    });
+
+    leftThirdBtn.addEventListener("click", () => {
+      CX_TARGET = 0.33;
+      speakAsync("왼쪽 3분할 구도 모드입니다.", true);
+    });
+
+    rightThirdBtn.addEventListener("click", () => {
+      CX_TARGET = 0.67;
+      speakAsync("오른쪽 3분할 구도 모드입니다.", true);
+    });
+
+    function setupROS() {
+      try {
+        ros = new ROSLIB.Ros({ url: ROSBRIDGE_URL });
+
+        ros.on("connection", () => console.log("rosbridge 연결됨"));
+        ros.on("error", (error) => console.log("rosbridge 오류:", error));
+        ros.on("close", () => console.log("rosbridge 연결 종료"));
+
+        subjectTopic = new ROSLIB.Topic({
+          ros: ros,
+          name: "/subject",
+          messageType: "std_msgs/String"
+        });
+
+        smilingTopic = new ROSLIB.Topic({
+          ros: ros,
+          name: "/all_smiling",
+          messageType: "std_msgs/Bool"
+        });
+
+        photoTopic = new ROSLIB.Topic({
+          ros: ros,
+          name: "/photo",
+          messageType: "std_msgs/String"
+        });
+
+        shootTopic = new ROSLIB.Topic({
+          ros: ros,
+          name: "/shoot",
+          messageType: "std_msgs/Bool"
+        });
+
+        ttsTopic = new ROSLIB.Topic({
+          ros: ros,
+          name: "/tts_text",
+          messageType: "std_msgs/String"
+        });
+
+        shootTopic.subscribe((msg) => {
+          if (msg.data === true) startBestShotSequence();
+        });
+
+        ttsTopic.subscribe((msg) => {
+          speakAsync(msg.data, false);
+        });
+
+      } catch (e) {
+        console.log("ROS 초기화 실패:", e);
+      }
+    }
+
+    async function startCamera() {
+      try {
+        startBtn.disabled = true;
+        status.innerText = "1단계: 카메라 권한 요청 중...";
+
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "user",
+            width: { ideal: 1280 },
+            height: { ideal: 720 },
+            aspectRatio: { ideal: 1.777777 }
+          },
+          audio: false
+        });
+
+        video.srcObject = stream;
+
+        await new Promise((resolve) => {
+          video.onloadedmetadata = resolve;
+        });
+
+        await video.play();
+
+        overlay.width = video.videoWidth;
+        overlay.height = video.videoHeight;
+
+        status.innerText = "2단계: MediaPipe WASM 로딩 중...";
+
+        const vision = await FilesetResolver.forVisionTasks(
+          "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+        );
+
+        status.innerText = "3단계: Pose 모델 로딩 중...";
+
+        poseLandmarker = await PoseLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task",
+            delegate: "CPU"
+          },
+          runningMode: "VIDEO",
+          numPoses: 7
+        });
+
+        status.innerText = "4단계: Face 모델 로딩 중...";
+
+        faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: {
+            modelAssetPath:
+              "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task",
+            delegate: "CPU"
+          },
+          runningMode: "VIDEO",
+          outputFaceBlendshapes: true,
+          numFaces: 1
+        });
+
+        running = true;
+        status.innerText = "인식 시작";
+        detectLoop();
+
+      } catch (err) {
+        console.error(err);
+        status.innerText =
+          "오류 발생:\n" + err.message +
+          "\n\n가능 원인:\n1. HTTPS/카메라 권한 문제\n2. 인터넷/CDN 접속 실패\n3. 모델 다운로드 실패\n4. 브라우저 호환 문제";
+        startBtn.disabled = false;
+      }
+    }
+
+    function resetSpeech() {
+      try {
+        speechSynthesis.cancel();
+      } catch (e) {}
+      ttsBusy = false;
+    }
+
+    function speakAsync(text, interrupt = false) {
+      return new Promise((resolve) => {
+        try {
+          if (interrupt) {
+            speechSynthesis.cancel();
+            ttsBusy = false;
+          }
+
+          if (ttsBusy && !interrupt) {
+            resolve();
+            return;
+          }
+
+          ttsBusy = true;
+
+          const utter = new SpeechSynthesisUtterance(text);
+          utter.lang = "ko-KR";
+          utter.rate = 0.85;
+
+          utter.onend = () => {
+            ttsBusy = false;
+            resolve();
+          };
+
+          utter.onerror = () => {
+            ttsBusy = false;
+            resolve();
+          };
+
+          speechSynthesis.speak(utter);
+        } catch (e) {
+          console.log("TTS 오류:", e);
+          ttsBusy = false;
+          resolve();
+        }
+      });
+    }
+
+    function guideSay(text) {
+      if (
+        shootState === STATE_COUNTDOWN ||
+        shootState === STATE_CAPTURE ||
+        shootState === STATE_COOLDOWN
+      ) {
+        return;
+      }
+
+      const now = performance.now();
+
+      if (text !== pendingGuideText) {
+        pendingGuideText = text;
+        pendingGuideStart = now;
+        return;
+      }
+
+      if (now - pendingGuideStart < GUIDE_STABLE_TIME) return;
+
+      if (text === lastGuideText && now - lastGuideTime < GUIDE_REPEAT_GAP) return;
+
+      lastGuideText = text;
+      lastGuideTime = now;
+
+      speakAsync(text, false);
+    }
+
+    function sleep(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    function getPoseBox(landmarks) {
+      let minX = 1;
+      let maxX = 0;
+      let minY = 1;
+      let maxY = 0;
+      let validCount = 0;
+
+      for (const p of landmarks) {
+        if (p.visibility !== undefined && p.visibility < 0.45) continue;
+
+        minX = Math.min(minX, p.x);
+        maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y);
+        maxY = Math.max(maxY, p.y);
+        validCount++;
+      }
+
+      if (validCount < 5) return null;
+
+      return { minX, maxX, minY, maxY };
+    }
+
+    function getPersonCenterAndSize(landmarks) {
+      const box = getPoseBox(landmarks);
+      if (!box) return null;
+
+      const leftShoulder = landmarks[11];
+      const rightShoulder = landmarks[12];
+      const leftHip = landmarks[23];
+      const rightHip = landmarks[24];
+
+      let centerX = (box.minX + box.maxX) / 2;
+      let centerY = (box.minY + box.maxY) / 2;
+
+      const corePoints = [leftShoulder, rightShoulder, leftHip, rightHip];
+      const visibleCore = corePoints.filter(
+        p => p && (p.visibility === undefined || p.visibility > 0.35)
+      );
+
+      if (visibleCore.length >= 2) {
+        centerX = visibleCore.reduce((s, p) => s + p.x, 0) / visibleCore.length;
+        centerY = visibleCore.reduce((s, p) => s + p.y, 0) / visibleCore.length;
+      }
+
+      return {
+        box,
+        centerX,
+        centerY,
+        height: box.maxY - box.minY,
+        width: box.maxX - box.minX
+      };
+    }
+
+    function getGroupPoseBox(allLandmarks) {
+      if (!allLandmarks || allLandmarks.length === 0) return null;
+
+      let minX = 1;
+      let maxX = 0;
+      let minY = 1;
+      let maxY = 0;
+
+      const centers = [];
+      const heights = [];
+
+      for (const landmarks of allLandmarks) {
+        const person = getPersonCenterAndSize(landmarks);
+        if (!person) continue;
+
+        if (person.height < 0.10 || person.width < 0.03) continue;
+
+        minX = Math.min(minX, person.box.minX);
+        maxX = Math.max(maxX, person.box.maxX);
+        minY = Math.min(minY, person.box.minY);
+        maxY = Math.max(maxY, person.box.maxY);
+
+        centers.push(person.centerX);
+        heights.push(person.height);
+      }
+
+      if (centers.length === 0) return null;
+
+      const avgCx = centers.reduce((a, b) => a + b, 0) / centers.length;
+      const avgHeight = heights.reduce((a, b) => a + b, 0) / heights.length;
+
+      return {
+        minX,
+        maxX,
+        minY,
+        maxY,
+        cx: avgCx,
+        size: avgHeight,
+        groupHeight: maxY - minY,
+        width: maxX - minX,
+        personCount: centers.length
+      };
+    }
+
+    function makeHeadCropFromPose(landmarks) {
+      const headIds = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+
+      let minX = 1;
+      let maxX = 0;
+      let minY = 1;
+      let maxY = 0;
+      let count = 0;
+
+      for (const id of headIds) {
+        const p = landmarks[id];
+        if (!p) continue;
+        if (p.visibility !== undefined && p.visibility < 0.25) continue;
+
+        minX = Math.min(minX, p.x);
+        maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y);
+        maxY = Math.max(maxY, p.y);
+        count++;
+      }
+
+      if (count < 3) return false;
+
+      const leftShoulder = landmarks[11];
+      const rightShoulder = landmarks[12];
+
+      let shoulderWidth = 0.12;
+      if (leftShoulder && rightShoulder) {
+        shoulderWidth = Math.abs(leftShoulder.x - rightShoulder.x);
+      }
+
+      const cx = (minX + maxX) / 2;
+      const cy = (minY + maxY) / 2;
+
+      let cropSize = Math.max(
+        maxX - minX,
+        maxY - minY,
+        shoulderWidth * 0.55,
+        0.10
+      );
+
+      cropSize *= 2.6;
+
+      let sx = (cx - cropSize / 2) * video.videoWidth;
+      let sy = (cy - cropSize / 2) * video.videoHeight;
+      let sw = cropSize * video.videoWidth;
+      let sh = cropSize * video.videoHeight;
+
+      sx = Math.max(0, sx);
+      sy = Math.max(0, sy);
+      sw = Math.min(video.videoWidth - sx, sw);
+      sh = Math.min(video.videoHeight - sy, sh);
+
+      faceCropCtx.clearRect(0, 0, 256, 256);
+      faceCropCtx.drawImage(video, sx, sy, sw, sh, 0, 0, 256, 256);
+
+      return true;
+    }
+
+    function getSmileScoreFromBlendshapes(blendshapes) {
+      if (!blendshapes || blendshapes.length === 0) return 0;
+
+      const categories = blendshapes[0].categories;
+      const left = categories.find(c => c.categoryName === "mouthSmileLeft");
+      const right = categories.find(c => c.categoryName === "mouthSmileRight");
+
+      const l = left ? left.score : 0;
+      const r = right ? right.score : 0;
+
+      return (l + r) / 2;
+    }
+
+    function getAllSmileResultFromPoseCrops(allLandmarks, now) {
+      if (!allLandmarks || allLandmarks.length === 0) {
+        return {
+          allSmiling: false,
+          avgSmile: 0,
+          faceCount: 0,
+          scores: [],
+          targetPersonCount: 0
+        };
+      }
+
+      const scores = [];
+      let detectedFaces = 0;
+      let targetPersonCount = 0;
+
+      for (let i = 0; i < allLandmarks.length; i++) {
+        const person = getPersonCenterAndSize(allLandmarks[i]);
+
+        if (!person) continue;
+        if (person.height < 0.10 || person.width < 0.03) continue;
+
+        targetPersonCount++;
+
+        const ok = makeHeadCropFromPose(allLandmarks[i]);
+
+        if (!ok) {
+          scores.push(0);
+          continue;
+        }
+
+        const faceResult = faceLandmarker.detectForVideo(faceCropCanvas, now + i);
+
+        if (!faceResult.faceBlendshapes || faceResult.faceBlendshapes.length === 0) {
+          scores.push(0);
+          continue;
+        }
+
+        detectedFaces++;
+        scores.push(getSmileScoreFromBlendshapes(faceResult.faceBlendshapes));
+      }
+
+      const avgSmile =
+        scores.length > 0
+          ? scores.reduce((a, b) => a + b, 0) / scores.length
+          : 0;
+
+      const allSmiling =
+        targetPersonCount > 0 &&
+        scores.length === targetPersonCount &&
+        detectedFaces === targetPersonCount &&
+        avgSmile >= AVG_SMILE_THRESHOLD &&
+        scores.every(s => s >= SMILE_THRESHOLD);
+
+      return {
+        allSmiling,
+        avgSmile,
+        faceCount: detectedFaces,
+        scores,
+        targetPersonCount
+      };
+    }
+
+    function updateSmileDebounce(rawAllSmiling) {
+      smileHistory.push(rawAllSmiling);
+
+      if (smileHistory.length > SMILE_HISTORY_SIZE) {
+        smileHistory.shift();
+      }
+
+      const smileCount = smileHistory.filter(v => v === true).length;
+      return smileCount >= SMILE_REQUIRED_COUNT;
+    }
+
+    function drawOverlay(box, smiling, smileResult, framed) {
+      ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+      const w = overlay.width;
+      const h = overlay.height;
+
+      const x = box.minX * w;
+      const y = box.minY * h;
+      const bw = (box.maxX - box.minX) * w;
+      const bh = (box.maxY - box.minY) * h;
+
+      ctx.strokeStyle = framed ? "lime" : "orange";
+      ctx.lineWidth = 4;
+      ctx.strokeRect(x, y, bw, bh);
+
+      ctx.strokeStyle = "white";
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(w * CX_TARGET, 0);
+      ctx.lineTo(w * CX_TARGET, h);
+      ctx.stroke();
+
+      ctx.fillStyle = smiling ? "lime" : "red";
+      ctx.font = "22px sans-serif";
+      ctx.fillText(`cx(avg): ${box.cx.toFixed(2)}`, 20, 40);
+      ctx.fillText(`size(avg): ${box.size.toFixed(2)}`, 20, 70);
+      ctx.fillText(`groupH: ${box.groupHeight.toFixed(2)}`, 20, 100);
+      ctx.fillText(`people: ${box.personCount}`, 20, 130);
+      ctx.fillText(`faces: ${smileResult.faceCount}/${smileResult.targetPersonCount}`, 20, 160);
+      ctx.fillText(`avgSmile: ${smileResult.avgSmile.toFixed(2)}`, 20, 190);
+      ctx.fillText(`scores: ${smileResult.scores.map(s => s.toFixed(2)).join(",")}`, 20, 220);
+      ctx.fillText(`allSmile: ${smiling}`, 20, 250);
+      ctx.fillText(`framed: ${framed}`, 20, 280);
+      ctx.fillText(`state: ${shootState}`, 20, 310);
+    }
+
+    function publishSubject(cx, size) {
+      const now = performance.now();
+
+      if (now - lastSubjectPublish < SUBJECT_PUBLISH_INTERVAL) return;
+      lastSubjectPublish = now;
+
+      if (!subjectTopic || !ros || !ros.isConnected) return;
+
+      subjectTopic.publish(new ROSLIB.Message({
+        data: JSON.stringify({
+          cx: cx,
+          size: size
+        })
+      }));
+    }
+
+    function publishSmile(smiling) {
+      if (lastSmileState === smiling) return;
+      lastSmileState = smiling;
+
+      if (!smilingTopic || !ros || !ros.isConnected) return;
+
+      smilingTopic.publish(new ROSLIB.Message({
+        data: smiling
+      }));
+    }
+
+    function captureJpeg() {
+      const srcW = video.videoWidth;
+      const srcH = video.videoHeight;
+
+      const maxW = 960;
+      const scale = maxW / srcW;
+
+      const outW = Math.round(srcW * scale);
+      const outH = Math.round(srcH * scale);
+
+      const snap = document.createElement("canvas");
+      snap.width = outW;
+      snap.height = outH;
+
+      const snapCtx = snap.getContext("2d");
+      snapCtx.drawImage(video, 0, 0, outW, outH);
+
+      return snap.toDataURL("image/jpeg", 0.8);
+    }
+
+    async function saveAndPublishPhoto(jpeg, labelText) {
+      const img = document.createElement("img");
+      img.src = jpeg;
+      gallery.prepend(img);
+
+      if (photoTopic && ros && ros.isConnected) {
+        photoTopic.publish(new ROSLIB.Message({
+          data: jpeg
+        }));
+      }
+
+      try {
+        const res = await fetch("/upload", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            image: jpeg
+          })
+        });
+
+        const data = await res.json();
+
+        if (data.ok) {
+          status.innerText = `${labelText}\n서버 저장됨: ${data.filename}`;
+        } else {
+          status.innerText = `${labelText}\n서버 저장 실패`;
+        }
+
+      } catch (err) {
+        status.innerText = `${labelText}\n서버 저장 실패:\n${err.message}`;
+      }
+    }
+
+    async function startBestShotSequence() {
+      if (shootState === STATE_COUNTDOWN || shootState === STATE_CAPTURE) return;
+
+      if (!video.videoWidth || !video.videoHeight) {
+        status.innerText = "카메라가 아직 준비되지 않았습니다.";
+        return;
+      }
+
+      shootState = STATE_COUNTDOWN;
+
+      status.innerText = "카운트다운: 셋";
+      await speakAsync("셋", true);
+      await sleep(300);
+
+      status.innerText = "카운트다운: 둘";
+      await speakAsync("둘", true);
+      await sleep(300);
+
+      status.innerText = "카운트다운: 하나";
+      await speakAsync("하나", true);
+
+      status.innerText = "촬영 준비...";
+      await sleep(1000);
+
+      shootState = STATE_CAPTURE;
+
+      const candidates = [];
+
+      for (let i = 0; i < 3; i++) {
+        const now = performance.now();
+        const poseResult = poseLandmarker.detectForVideo(video, now);
+        const smileResult = getAllSmileResultFromPoseCrops(poseResult.landmarks, now);
+        const jpeg = captureJpeg();
+
+        candidates.push({
+          jpeg,
+          score: smileResult.avgSmile
+        });
+
+        status.innerText = `베스트컷 촬영 중... ${i + 1}/3`;
+        await sleep(300);
+      }
+
+      candidates.sort((a, b) => b.score - a.score);
+
+      await saveAndPublishPhoto(
+        candidates[0].jpeg,
+        `찰칵! 베스트컷 선택됨\nsmileScore: ${candidates[0].score.toFixed(2)}`
+      );
+
+      await speakAsync("찰칵! 촬영했습니다.", true);
+
+      lastShot = performance.now();
+      shootState = STATE_COOLDOWN;
+      guideSaid = true;
+      smilingSince = null;
+      smileHistory = [];
+
+      setTimeout(() => {
+        shootState = STATE_TRACKING;
+        guideSaid = false;
+      }, SHOOT_COOLDOWN);
+    }
+
+    function detectLoop() {
+      if (!running || !poseLandmarker || !faceLandmarker) return;
+
+      const now = performance.now();
+      const poseResult = poseLandmarker.detectForVideo(video, now);
+
+      if (!poseResult.landmarks || poseResult.landmarks.length === 0) {
+        status.innerText = "사람 없음";
+
+        smilingSince = null;
+        guideSaid = false;
+        smileHistory = [];
+        smoothCx = null;
+        smoothSize = null;
+
+        ctx.clearRect(0, 0, overlay.width, overlay.height);
+        publishSmile(false);
+
+        requestAnimationFrame(detectLoop);
+        return;
+      }
+
+      const groupBox = getGroupPoseBox(poseResult.landmarks);
+
+      if (!groupBox) {
+        status.innerText = "사람 인식 불안정";
+
+        smilingSince = null;
+        guideSaid = false;
+        smileHistory = [];
+        smoothCx = null;
+        smoothSize = null;
+
+        publishSmile(false);
+        requestAnimationFrame(detectLoop);
+        return;
+      }
+
+      const rawSmileResult = getAllSmileResultFromPoseCrops(poseResult.landmarks, now);
+      const smiling = updateSmileDebounce(rawSmileResult.allSmiling);
+
+      const smileResult = {
+        ...rawSmileResult,
+        allSmiling: smiling
+      };
+
+      if (smoothCx === null) {
+        smoothCx = groupBox.cx;
+        smoothSize = groupBox.size;
+      } else {
+        smoothCx =
+          SUBJECT_SMOOTH_ALPHA * groupBox.cx +
+          (1 - SUBJECT_SMOOTH_ALPHA) * smoothCx;
+
+        smoothSize =
+          SUBJECT_SMOOTH_ALPHA * groupBox.size +
+          (1 - SUBJECT_SMOOTH_ALPHA) * smoothSize;
+      }
+
+      const smoothedBox = {
+        ...groupBox,
+        cx: smoothCx,
+        size: smoothSize
+      };
+
+      const framed =
+        Math.abs(smoothedBox.cx - CX_TARGET) < CX_DEADBAND &&
+        Math.abs(smoothedBox.size - SIZE_TARGET) < SIZE_DEADBAND;
+
+      drawOverlay(smoothedBox, smiling, smileResult, framed);
+
+      publishSubject(smoothedBox.cx, smoothedBox.size);
+      publishSmile(smiling);
+
+      if (
+        shootState === STATE_COUNTDOWN ||
+        shootState === STATE_CAPTURE ||
+        shootState === STATE_COOLDOWN
+      ) {
+        requestAnimationFrame(detectLoop);
+        return;
+      }
+
+      if (!framed) {
+        shootState = STATE_TRACKING;
+        guideSaid = false;
+        smilingSince = null;
+
+        let guideText = "";
+
+        if (smoothedBox.cx < CX_TARGET - CX_DEADBAND) {
+          guideText = "오른쪽으로 이동하세요.";
+        } else if (smoothedBox.cx > CX_TARGET + CX_DEADBAND) {
+          guideText = "왼쪽으로 이동하세요.";
+        } else if (smoothedBox.size < SIZE_TARGET - SIZE_DEADBAND) {
+          guideText = "가까이 오세요.";
+        } else if (smoothedBox.size > SIZE_TARGET + SIZE_DEADBAND) {
+          guideText = "뒤로 가세요.";
+        }
+
+        if (guideText !== "") {
+          status.innerText = guideText;
+          guideSay(guideText);
+        }
+
+      } else {
+        shootState = STATE_FRAMED;
+
+        if (!guideSaid) {
+          guideSaid = true;
+          speakAsync("좋아요. 그대로 웃어주세요.", false);
+        }
+
+        if (smiling) {
+          status.innerText =
+            `구도 완료. 전원 미소 1.5초 확인 중...\n사람 ${smoothedBox.personCount}명 / 얼굴 ${smileResult.faceCount}/${smileResult.targetPersonCount}명\n평균 미소: ${smileResult.avgSmile.toFixed(2)}`;
+
+          if (smilingSince === null) {
+            smilingSince = now;
+          }
+
+          if (
+            now - smilingSince > SMILE_HOLD &&
+            now - lastShot > SHOOT_COOLDOWN
+          ) {
+            smilingSince = null;
+            startBestShotSequence();
+          }
+
+        } else {
+          status.innerText =
+            `구도 완료. 전원이 웃어야 촬영됩니다.\n사람 ${smoothedBox.personCount}명 / 얼굴 ${smileResult.faceCount}/${smileResult.targetPersonCount}명\n평균 미소: ${smileResult.avgSmile.toFixed(2)}\n개별 점수: ${smileResult.scores.map(s => s.toFixed(2)).join(", ")}`;
+
+          smilingSince = null;
+        }
+      }
+
+      requestAnimationFrame(detectLoop);
+    }
+  </script>
+</body>
+</html>
